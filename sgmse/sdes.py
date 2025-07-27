@@ -148,7 +148,7 @@ class OUVESDE(SDE):
         parser.add_argument("--theta", type=float, default=1.5, help="The constant stiffness of the Ornstein-Uhlenbeck process. 1.5 by default.")
         parser.add_argument("--sigma-min", type=float, default=0.05, help="The minimum sigma to use. 0.05 by default.")
         parser.add_argument("--sigma-max", type=float, default=0.5, help="The maximum sigma to use. 0.5 by default.")
-        parser.add_argument("--N", type=int, default=30, help="The number of timesteps in the SDE discretization. 30 by default")
+        parser.add_argument("--N", type=int, default=50, help="The number of timesteps in the SDE discretization. 30 by default")
         parser.add_argument("--sampler_type", type=str, default="pc", help="Type of sampler to use. 'pc' by default.")
         return parser
 
