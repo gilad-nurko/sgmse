@@ -5,13 +5,14 @@ import warnings
 import torch
 import pytorch_lightning as pl
 import torch.distributed as dist
-import torchaudio
-import torch.nn.functional as F
+from torchaudio import load
 from torch_ema import ExponentialMovingAverage
 from librosa import resample
 import torchmetrics
 import whisper
-
+import os
+import torch.nn.functional as F
+import torchaudio
 from sgmse import sampling
 from sgmse.sdes import SDERegistry
 from sgmse.backbones import BackboneRegistry
@@ -28,7 +29,8 @@ class WhisperGuidedScoreModel(pl.LightningModule):
         parser.add_argument("--lr", type=float, default=1e-4, help="The learning rate (1e-4 by default)")
         parser.add_argument("--ema_decay", type=float, default=0.999, help="The parameter EMA decay constant (0.999 by default)")
         parser.add_argument("--t_eps", type=float, default=0.03, help="The minimum process time (0.03 by default)")
-        parser.add_argument("--num_eval_files", type=int, default=20, help="Number of files for speech enhancement performance evaluation during training. Pass 0 to turn off (no checkpoints based on evaluation metrics will be generated).")
+        parser.add_argument("--num_eval_files", type=int, default=500, # was 20
+                            help="Number of files for speech enhancement performance evaluation during training. Pass 0 to turn off (no checkpoints based on evaluation metrics will be generated).")
         parser.add_argument("--loss_type", type=str, default="score_matching", help="The type of loss function to use.")
         parser.add_argument("--loss_weighting", type=str, default="sigma^2", help="The weighting of the loss function.")
         parser.add_argument("--network_scaling", type=str, default=None, help="The type of loss scaling to use.")
@@ -47,7 +49,8 @@ class WhisperGuidedScoreModel(pl.LightningModule):
     def __init__(
         self, backbone, sde, lr=1e-4, ema_decay=0.999, t_eps=0.03, num_eval_files=20, loss_type='score_matching', 
         loss_weighting='sigma^2', network_scaling=None, c_in='1', c_out='1', c_skip='0', sigma_data=0.1, 
-        l1_weight=0.001, pesq_weight=0.0, sr=16000, whisper_lang='en', data_module_cls=None, **kwargs
+        l1_weight=0.001, pesq_weight=0.0, sr=16000, data_module_cls=None, whisper_lang='en', model_mode="regular",
+        whisper_name="base", guidance_scale=1.0, distillation_weight=1.0, **kwargs
     ):
         """
         Create a new ScoreModel.
@@ -72,6 +75,8 @@ class WhisperGuidedScoreModel(pl.LightningModule):
         self.sde = sde_cls(**kwargs)
         # Store hyperparams and save them
         self.lr = lr
+        self.ema_decay = ema_decay
+        self.ema = ExponentialMovingAverage(self.parameters(), decay=self.ema_decay)
         self._error_loading_ema = False
         self.t_eps = t_eps
         self.loss_type = loss_type
@@ -85,17 +90,18 @@ class WhisperGuidedScoreModel(pl.LightningModule):
         self.sigma_data = sigma_data
         self.num_eval_files = num_eval_files
         self.sr = sr
+        self.debug = True
         # Initialize PESQ loss if pesq_weight > 0.0
         if pesq_weight > 0.0:
             self.pesq_loss = PesqLoss(1.0, sample_rate=sr).eval()
             for param in self.pesq_loss.parameters():
                 param.requires_grad = False
         self.save_hyperparameters(ignore=['no_wandb'])
-
+        self.data_module = data_module_cls(**kwargs, gpu=kwargs.get('gpus', 0) > 0)
         self.allowed_words = ["down","go","left","no","off","on","right","stop","up","yes"]
         self.options = whisper.DecodingOptions(language=whisper_lang, without_timestamps=True)
-        self.whisper = whisper.load_model(f'base')
-        self.tokenizer = whisper.tokenizer.get_tokenizer(True, language=whisper_lang, task=self.options.task)
+        self.whisper = whisper.load_model(whisper_name)
+        self.multilingual_tokenizer = whisper.tokenizer.get_tokenizer(True, language=whisper_lang, task=self.options.task)
         if hasattr(self.whisper, 'alignment_heads') and self.whisper.alignment_heads.is_sparse:
         # Convert the sparse buffer to a dense buffer
             self.whisper.alignment_heads = self.whisper.alignment_heads.to_dense()    
@@ -103,18 +109,14 @@ class WhisperGuidedScoreModel(pl.LightningModule):
         for param in self.whisper.parameters():
             param.requires_grad = False
             
-            # Cross entropy loss for ASR
-            self.whisper_loss = torch.nn.CrossEntropyLoss(ignore_index=-100)
+        # Cross entropy loss for ASR
+        self.whisper_loss = torch.nn.CrossEntropyLoss(ignore_index=-100)
 
-        self.data_module = data_module_cls(**kwargs, gpu=kwargs.get('gpus', 0) > 0)
-        ids = [self.tokenizer.encode(" " + w) for w in self.allowed_words]
+        ids = [self.multilingual_tokenizer.encode(" " + w) for w in self.allowed_words]
         for w, tok in zip(self.allowed_words, ids):
             if len(tok) != 1:
                 print(f"⚠️  '{w}' tokenises to {tok} – handle multi-token keywords!")
         self.allowed_toks = torch.tensor([tok[0] for tok in ids])
-        self.debug = False
-        self.ema_decay = ema_decay
-        self.ema = ExponentialMovingAverage(self.parameters(), decay=self.ema_decay)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
@@ -123,7 +125,7 @@ class WhisperGuidedScoreModel(pl.LightningModule):
     def optimizer_step(self, *args, **kwargs):
         # Method overridden so that the EMA params are updated after each optimizer step
         super().optimizer_step(*args, **kwargs)
-        self.ema.update(self.parameters())
+        self.ema.update(self.dnn.parameters())
 
     # on_load_checkpoint / on_save_checkpoint needed for EMA storing/loading
     def on_load_checkpoint(self, checkpoint):
@@ -142,196 +144,91 @@ class WhisperGuidedScoreModel(pl.LightningModule):
         if not self._error_loading_ema:
             if mode == False and not no_ema:
                 # eval
-                self.ema.store(self.parameters())        # store current params in EMA
-                self.ema.copy_to(self.parameters())      # copy EMA parameters over current params for evaluation
+                self.ema.store(self.dnn.parameters())        # store current params in EMA
+                self.ema.copy_to(self.dnn.parameters())      # copy EMA parameters over current params for evaluation
             else:
                 # train
                 if self.ema.collected_params is not None:
-                    self.ema.restore(self.parameters())  # restore the EMA weights (if stored)
+                    self.ema.restore(self.dnn.parameters())  # restore the EMA weights (if stored)
         return res
 
     def eval(self, no_ema=False):
         return self.train(False, no_ema=no_ema)
 
-    # def _loss(self, forward_out, x_t, z, t, mean, x, masks):
-    #     """
-    #     Different loss functions can be used to train the score model, see the paper: 
+    def _loss(self, forward_out, x_t, z, t, mean, x):
+        """
+        Different loss functions can be used to train the score model, see the paper: 
         
-    #     Julius Richter, Danilo de Oliveira, and Timo Gerkmann
-    #     "Investigating Training Objectives for Generative Speech Enhancement"
-    #     https://arxiv.org/abs/2409.10753
+        Julius Richter, Danilo de Oliveira, and Timo Gerkmann
+        "Investigating Training Objectives for Generative Speech Enhancement"
+        https://arxiv.org/abs/2409.10753
 
-    #     """
-
-    #     sigma = self.sde._std(t)[:, None, None, None]
-
-    #     if self.loss_type == "score_matching":
-    #         score = forward_out
-    #         if self.loss_weighting == "sigma^2":
-    #             losses = torch.square(torch.abs(score * sigma + z)) # Eq. (7)
-    #         else:
-    #             raise ValueError("Invalid loss weighting for loss_type=score_matching: {}".format(self.loss_weighting))
-    #         # Sum over spatial dimensions and channels and mean over batch
-    #         loss = torch.mean(0.5*torch.sum(losses.reshape(losses.shape[0], -1), dim=-1))
-    #     elif self.loss_type == "denoiser":
-    #         score = forward_out
-    #         D = score * sigma.pow(2) + x_t # equivalent to Eq. (10)
-    #         losses = torch.square(torch.abs(D - mean)) # Eq. (8)
-    #         if self.loss_weighting == "1":
-    #             losses = losses
-    #         elif self.loss_weighting == "sigma^2":
-    #             losses = losses * sigma**2
-    #         elif self.loss_weighting == "edm":
-    #             losses = ((sigma**2 + self.sigma_data**2)/((sigma*self.sigma_data)**2))[:, None, None, None] * losses
-    #         else:
-    #             raise ValueError("Invalid loss weighting for loss_type=denoiser: {}".format(self.loss_weighting))
-    #         # Sum over spatial dimensions and channels and mean over batch
-    #         loss = torch.mean(0.5*torch.sum(losses.reshape(losses.shape[0], -1), dim=-1))     
-    #     elif self.loss_type == "data_prediction":
-    #         x_hat = forward_out
-    #         B, C, F, T = x.shape
-
-    #         # losses in the time-frequency domain (tf)
-    #         losses_tf = (1/(F*T))*torch.square(torch.abs(x_hat - x))
-    #         losses_tf = torch.mean(0.5*torch.sum(losses_tf.reshape(losses_tf.shape[0], -1), dim=-1))
-
-    #         # losses in the time domain (td)
-    #         target_len = (self.data_module.num_frames - 1) * self.data_module.hop_length
-    #         x_hat_td = self.to_audio(x_hat.squeeze(), target_len)
-    #         x_td = self.to_audio(x.squeeze(), target_len)
-    #         losses_l1 = (1 / target_len) * torch.abs(x_hat_td - x_td)
-    #         losses_l1 = torch.mean(0.5*torch.sum(losses_l1.reshape(losses_l1.shape[0], -1), dim=-1))
-
-    #         # losses using PESQ
-    #         if self.pesq_weight > 0.0:
-    #             losses_pesq = self.pesq_loss(x_td, x_hat_td)
-    #             losses_pesq = torch.mean(losses_pesq)
-    #             # combine the losses
-    #             loss = losses_tf + self.l1_weight * losses_l1 + self.pesq_weight * losses_pesq 
-    #         else:
-    #             loss = losses_tf + self.l1_weight * losses_l1
-    #     else:
-    #         raise ValueError("Invalid loss type: {}".format(self.loss_type))
-
-    #     return loss
-
-    def _loss(self, forward_out, x_t, z, t, mean, x, masks):
         """
-        Masks: (B, 2, F, T) with 1 for valid frames, 0 for padding.
-            masks[:, 1] corresponds to the clean target 'x'.
-        """
-
-        # ----- helpers -----
-        def masked_mean(tensor, mask, sum_dims):
-            # tensor, mask broadcastable; mask is 0/1
-            num = (tensor * mask).sum(dim=sum_dims)
-            den = mask.sum(dim=sum_dims).clamp_min(1e-8)
-            return (num / den).mean()  # mean over batch
-
-        B, C, F, T = x.shape
-        device = x.device
-
-        # clean TF mask (broadcast to channel dim)
-        # masks_x: (B, 1, F, T) with 0/1 floats
-        masks_x = masks[:, 1:2, ...].to(x.dtype)
 
         sigma = self.sde._std(t)[:, None, None, None]
 
         if self.loss_type == "score_matching":
             score = forward_out
             if self.loss_weighting == "sigma^2":
-                # Eq. (7)
-                losses = torch.square(torch.abs(score * sigma + z))  # (B, C, F, T)
+                losses = torch.square(torch.abs(score * sigma + z)) # Eq. (7)
             else:
-                raise ValueError(f"Invalid loss weighting for loss_type=score_matching: {self.loss_weighting}")
-
-            # masked mean over C,F,T then mean over batch; keep your 0.5 factor
-            loss = 0.5 * masked_mean(losses, masks_x, sum_dims=(1, 2, 3))
-
+                raise ValueError("Invalid loss weighting for loss_type=score_matching: {}".format(self.loss_weighting))
+            # Sum over spatial dimensions and channels and mean over batch
+            loss = torch.mean(0.5*torch.sum(losses.reshape(losses.shape[0], -1), dim=-1))
         elif self.loss_type == "denoiser":
             score = forward_out
-            # Eq. (10)
-            D = score * sigma.pow(2) + x_t
-            # Eq. (8)
-            losses = torch.square(torch.abs(D - mean))  # (B, C, F, T)
-
+            D = score * sigma.pow(2) + x_t # equivalent to Eq. (10)
+            losses = torch.square(torch.abs(D - mean)) # Eq. (8)
             if self.loss_weighting == "1":
-                pass
+                losses = losses
             elif self.loss_weighting == "sigma^2":
                 losses = losses * sigma**2
             elif self.loss_weighting == "edm":
-                w = ((sigma**2 + self.sigma_data**2) / ((sigma * self.sigma_data)**2))[:, None, None, None]
-                losses = w * losses
+                losses = ((sigma**2 + self.sigma_data**2)/((sigma*self.sigma_data)**2))[:, None, None, None] * losses
             else:
-                raise ValueError(f"Invalid loss weighting for loss_type=denoiser: {self.loss_weighting}")
-
-            loss = 0.5 * masked_mean(losses, masks_x, sum_dims=(1, 2, 3))
-
+                raise ValueError("Invalid loss weighting for loss_type=denoiser: {}".format(self.loss_weighting))
+            # Sum over spatial dimensions and channels and mean over batch
+            loss = torch.mean(0.5*torch.sum(losses.reshape(losses.shape[0], -1), dim=-1))     
         elif self.loss_type == "data_prediction":
             x_hat = forward_out
+            B, C, F, T = x.shape
 
-            # ----- TF loss (masked) -----
-            losses_tf = torch.square(torch.abs(x_hat - x))  # (B, C, F, T)
-            # original code averaged by (F*T); here we do a true masked mean
-            loss_tf = 0.5 * masked_mean(losses_tf, masks_x, sum_dims=(1, 2, 3))
+            # losses in the time-frequency domain (tf)
+            losses_tf = (1/(F*T))*torch.square(torch.abs(x_hat - x))
+            losses_tf = torch.mean(0.5*torch.sum(losses_tf.reshape(losses_tf.shape[0], -1), dim=-1))
 
-            # ----- TD loss (masked on valid samples only) -----
-            # Build a time mask in samples from the TF mask (1 if any freq is valid)
-            # time_mask: (B, T_frames)
-            time_mask_frames = masks[:, 1, ...].any(dim=1).to(x.dtype)  # (B, T)
-            # valid samples per item (approx): frames * hop_length
-            hop = self.data_module.hop_length
-            valid_len = (time_mask_frames.sum(dim=1) * hop).long()  # (B,)
+            # losses in the time domain (td)
+            target_len = (self.data_module.num_frames - 1) * self.data_module.hop_length
+            x_hat_td = self.to_audio(x_hat.squeeze(), target_len)
+            x_td = self.to_audio(x.squeeze(), target_len)
+            losses_l1 = (1 / target_len) * torch.abs(x_hat_td - x_td)
+            losses_l1 = torch.mean(0.5*torch.sum(losses_l1.reshape(losses_l1.shape[0], -1), dim=-1))
 
-            target_len = (self.data_module.num_frames - 1) * hop
-            x_hat_td = self.to_audio(x_hat.squeeze(1), target_len)  # (B, target_len)
-            x_td     = self.to_audio(x.squeeze(1),    target_len)   # (B, target_len)
-
-            # Build per-sample 1D masks in samples: (B, target_len)
-            time_mask_samples = torch.zeros((B, target_len), dtype=x.dtype, device=device)
-            for b in range(B):
-                L = int(valid_len[b].item())
-                L = min(L, target_len)
-                if L > 0:
-                    time_mask_samples[b, :L] = 1.0
-
-            # L1 masked mean per sample, then mean over batch (keep your 0.5 factor)
-            l1 = torch.abs(x_hat_td - x_td)  # (B, target_len)
-            num = (l1 * time_mask_samples).sum(dim=1)
-            den = time_mask_samples.sum(dim=1).clamp_min(1e-8)
-            loss_l1 = 0.5 * (num / den).mean()
-
-            # ----- optional PESQ on the valid (unpadded) part only -----
+            # losses using PESQ
             if self.pesq_weight > 0.0:
-                pesq_list = []
-                for b in range(B):
-                    L = int(valid_len[b].item())
-                    L = max(L, 1)  # avoid zero length
-                    ref = x_td[b, :L].unsqueeze(0)
-                    est = x_hat_td[b, :L].unsqueeze(0)
-                    pesq_list.append(self.pesq_loss(ref, est))  # scalar tensor
-                losses_pesq = torch.stack(pesq_list).mean()
-                loss = loss_tf + self.l1_weight * loss_l1 + self.pesq_weight * losses_pesq
+                losses_pesq = self.pesq_loss(x_td, x_hat_td)
+                losses_pesq = torch.mean(losses_pesq)
+                # combine the losses
+                loss = losses_tf + self.l1_weight * losses_l1 + self.pesq_weight * losses_pesq 
             else:
-                loss = loss_tf + self.l1_weight * loss_l1
-
+                loss = losses_tf + self.l1_weight * losses_l1
         else:
-            raise ValueError(f"Invalid loss type: {self.loss_type}")
+            raise ValueError("Invalid loss type: {}".format(self.loss_type))
 
         return loss
 
-
     def _step(self, batch, batch_idx):
-        specs, masks, multilingual_tokens, labels = batch["specs"], batch["masks"], batch["multilingual_tokens"], batch["labels"]
-        y = specs[:, 0:1, ...]   # (B,1,F,T)  noisy
-        x = specs[:, 1:2, ...]   # (B,1,F,T)  clean
+        specs, multilingual_tokens, labels = batch["specs"], batch["multilingual_tokens"], batch["labels"]
+        y = specs[:, 0:1]        # (B, 1, F, T)
+        x = specs[:, 1:2]        # (B, 1, F, T)
+
         t = torch.rand(x.shape[0], device=x.device) * (self.sde.T - self.t_eps) + self.t_eps
         mean, std = self.sde.marginal_prob(x, y, t)
         z = torch.randn_like(x)  # i.i.d. normal distributed with var=0.5
         sigma = std[:, None, None, None]
         x_t = mean + sigma * z
         forward_out = self(x_t, y, t)
-        loss = self._loss(forward_out, x_t, z, t, mean, x, masks)
+        loss = self._loss(forward_out, x_t, z, t, mean, x)
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -339,202 +236,182 @@ class WhisperGuidedScoreModel(pl.LightningModule):
         self.log('train_loss', loss, on_step=True, on_epoch=True, sync_dist=True, prog_bar=True)
         return loss
 
+
     def validation_step(self, batch, batch_idx):
-        # ---- once-per-epoch gate ----
+        # Evaluate speech enhancement performance
         if batch_idx == 0 and self.num_eval_files != 0:
             rank = dist.get_rank()
             world_size = dist.get_world_size()
+
+            # Split the evaluation files among the GPUs
             eval_files_per_gpu = self.num_eval_files // world_size
-            indices_all = list(range(min(self.num_eval_files, len(self.data_module.valid_set))))
+
+            clean_files = self.data_module.valid_set.clean_files[:self.num_eval_files]
+            noisy_files = self.data_module.valid_set.noisy_files[:self.num_eval_files]
+            # if not hasattr(self, "eval_perm"):               # compute only the first time
+            #     num_total = len(self.data_module.valid_set.clean_files)
+            #     num_eval  = min(self.num_eval_files, num_total)
+
+            #     g = torch.Generator().manual_seed(0)     # ← any fixed integer seed you like
+            #     perm = torch.randperm(num_total, generator=g)[:num_eval].tolist()
+
+            #     self.eval_perm = perm                        # cache for future epochs
+
+            # clean_files = [self.data_module.valid_set.clean_files[i] for i in self.eval_perm]
+            # noisy_files = [self.data_module.valid_set.noisy_files[i] for i in self.eval_perm]
+
+            # Select the files for this GPU     
             if rank == world_size - 1:
-                indices = indices_all[rank * eval_files_per_gpu :]
-            else:
-                indices = indices_all[rank * eval_files_per_gpu : (rank + 1) * eval_files_per_gpu]
+                clean_files = clean_files[rank*eval_files_per_gpu:]
+                noisy_files = noisy_files[rank*eval_files_per_gpu:]
+            else:   
+                clean_files = clean_files[rank*eval_files_per_gpu:(rank+1)*eval_files_per_gpu]
+                noisy_files = noisy_files[rank*eval_files_per_gpu:(rank+1)*eval_files_per_gpu]  
 
-            # accumulators
-            pesq_sum = 0.0; si_sdr_sum = 0.0; estoi_sum = 0.0
-            preds_clean, preds_noisy, preds_enh, refs = [], [], [], []
+            # Evaluate the performance of the model
+            pesq_sum = 0; pesq_cnt = 0; si_sdr_sum = 0; estoi_sum = 0; 
+            # lists for WER (exactly as before)
+            o_list, l_list = [], []
+            o_list_clean, o_list_corrupted = [], []
+            # extra containers
+            correct_cnt_clean, correct_cnt_corrupted, correct_cnt_enhanced, total_cnt = 0, 0, 0, 0
+            self.allowed_toks = self.allowed_toks.to(self.whisper.device)
 
-            vp = self.data_module.valid_set
-            hop = self.data_module.hop_length
-            n_fft = self.data_module.n_fft
-            target_len = (self.data_module.num_frames - 1) * hop
-            sr_target = getattr(self.data_module, "sample_rate", 16000)
-            norm_mode = getattr(self.data_module, "normalize", "noisy")
-
-            # ---------- closed-set Whisper decode helpers ----------
+            # helper: fast mask of special tokens
             special_ids = {
-                self.tokenizer.eot,
-                self.tokenizer.encode("<|en|>",           allowed_special={"<|en|>"})[0],
-                self.tokenizer.encode("<|transcribe|>",   allowed_special={"<|transcribe|>"})[0],
-                self.tokenizer.encode("<|notimestamps|>", allowed_special={"<|notimestamps|>"})[0],
-                self.tokenizer.encode("<|nospeech|>",     allowed_special={"<|nospeech|>"})[0],
+                self.multilingual_tokenizer.eot,
+                self.multilingual_tokenizer.encode("<|en|>",           allowed_special={"<|en|>"})[0],
+                self.multilingual_tokenizer.encode("<|transcribe|>",   allowed_special={"<|transcribe|>"})[0],
+                self.multilingual_tokenizer.encode("<|notimestamps|>", allowed_special={"<|notimestamps|>"})[0],
+                self.multilingual_tokenizer.encode("<|nospeech|>",     allowed_special={"<|nospeech|>"})[0],
             }
-            whisper_device = next(self.whisper.parameters()).device
+            for i, (clean_file, noisy_file) in enumerate(zip(clean_files, noisy_files)):
+                # Load the clean and noisy speech
+                x, sr_x = load(clean_file)
+                x = x.squeeze().numpy()
+                y, sr_y = load(noisy_file) 
+                assert sr_x == sr_y, "Sample rates of clean and noisy files do not match!"
 
-            def keyword_index(labels_tensor: torch.Tensor) -> int:
-                for j, t in enumerate(labels_tensor.tolist()):
-                    if t not in special_ids:
-                        return j
-                # fallback: last token before EOT
-                ids = labels_tensor.tolist()
-                eot = self.tokenizer.eot
-                return max(0, (ids.index(eot) if eot in ids else len(ids)) - 1)
-
-            @torch.no_grad()  # eval‑only; remove if you later want gradients through Whisper
-            def run_whisper_closedset(mel_80x3000, multilingual_tokens, labels):
-                mel_80x3000 = mel_80x3000.to(whisper_device)
-                multilingual_tokens = multilingual_tokens.to(whisper_device)
-                labels = labels.to(whisper_device)
-                feats  = self.whisper.encoder(mel_80x3000.unsqueeze(0))               # (1, D, T')
-                logits = self.whisper.decoder(multilingual_tokens.unsqueeze(0), feats).squeeze(0)  # (L, V)
-                kidx   = keyword_index(labels)
-                kw_logits = logits[kidx, self.allowed_toks.to(logits.device)]         # (10,)
-                pred_id   = int(torch.argmax(kw_logits).item())
-                return self.allowed_words[pred_id]
-
-            # ---------- STFT -> log‑mel helper (inline, differentiable) ----------
-            # Build a mel filterbank once for this block.
-            n_freqs = n_fft // 2 + 1
-            n_mels = 80
-            try:
-                # Use Whisper's exact filterbank if available (constant matrix, OK for autograd)
-                from whisper.audio import mel_filters as whisper_mel_filters
-                mel_fb = whisper_mel_filters(sr_target)[:n_mels, :]  # (80, n_freqs expected 201)
-                if mel_fb.shape[1] != n_freqs:
-                    # fallback if shapes don't match current n_fft
-                    mel_fb = torchaudio.functional.melscale_fbanks(
-                        n_freqs=n_freqs, n_mels=n_mels, sample_rate=sr_target,
-                        f_min=0.0, f_max=sr_target/2, norm="slaney", mel_scale="slaney"
-                    )
-            except Exception:
-                mel_fb = torchaudio.functional.melscale_fbanks(
-                    n_freqs=n_freqs, n_mels=n_mels, sample_rate=sr_target,
-                    f_min=0.0, f_max=sr_target/2, norm="slaney", mel_scale="slaney"
-                )
-            mel_fb = mel_fb.to(self.device)  # (80, n_freqs)
-
-            def stft_to_logmel(spec_cplx_FT: torch.Tensor) -> torch.Tensor:
-                """
-                spec_cplx_FT: (F, T) complex from torch.stft
-                returns: (80, 3000) log10-mel (pad/trim on time to 3000)
-                """
-                power = spec_cplx_FT.abs().pow(2.0)                       # (F, T)
-                mel = mel_fb @ power                                      # (80, T)
-                logmel = torch.log10(mel.clamp_min(1e-10))                # (80, T)
-                T = logmel.size(-1)
-                if T > 3000:
-                    logmel = logmel[..., :3000]
-                elif T < 3000:
-                    logmel = F.pad(logmel, (0, 3000 - T))
-                return logmel
-
-            # ======================= MAIN LOOP =======================
-            for i in indices:
-                # dataset sample (for mask/tokens/labels)
-                specs, masks, multilingual_tokens, labels = vp[i]  # specs: (2, F, T) complex
-                # order: [noisy, clean]
-                noisy_spec_fwd, clean_spec_fwd = specs[0].to(self.device), specs[1].to(self.device)
-
-                # load waveforms by index (for audio-domain metrics)
-                clean_path = vp.clean_files[i]
-                noisy_path = vp.noisy_files[i]
-                x, sr_x = torchaudio.load(clean_path)
-                y, sr_y = torchaudio.load(noisy_path)
-                if sr_x != sr_target:
-                    x = torchaudio.functional.resample(x, sr_x, sr_target)
-                if sr_y != sr_target:
-                    y = torchaudio.functional.resample(y, sr_y, sr_target)
-
-                def fit_to_target(sig):
-                    cur = sig.size(-1)
-                    pad = target_len - cur
-                    if pad > 0:
-                        sig = F.pad(sig, (0, pad))
-                    elif pad < 0:
-                        sig = sig[..., :target_len]
-                    return sig
-                x, y = fit_to_target(x), fit_to_target(y)
-
-                # dataset-style normalization (single place)
-                if norm_mode == "noisy":
-                    norm = y.abs().max()
-                elif norm_mode == "clean":
-                    norm = x.abs().max()
+                # Resample if necessary
+                if sr_x != 16000:
+                    x_16k = resample(x, orig_sr=sr_x, target_sr=16000).squeeze()
+                    y_16k = resample(y, orig_sr=sr_y, target_sr=16000).squeeze()
                 else:
-                    norm = x.new_tensor(1.0)
-                x, y = x / norm, y / norm
+                    x_16k = x
+                    y_16k = y
+                
+                label_str = os.path.splitext(os.path.basename(clean_file))[0].split('_')[0]
+                tokens = [*self.multilingual_tokenizer.sot_sequence_including_notimestamps] \
+                        + self.multilingual_tokenizer.encode(" " + label_str)
+                labels = tokens[1:] + [self.multilingual_tokenizer.eot]
+                multilingual_tokens = torch.tensor(tokens, dtype=torch.long)
+                labels = torch.tensor(labels, dtype=torch.long)
 
-                # valid (unpadded) length for audio metrics
-                n_valid_frames = int(masks[1].any(dim=0).sum().item())  # clean mask
-                valid_len = min(n_valid_frames * hop, target_len)
+                multilingual_tokens = multilingual_tokens.to(self.whisper.device)
+                labels = labels.to(self.whisper.device)
 
-                # -------- enhance -> spectrogram (no (de)norm inside) --------
-                x_hat_spec_fwd, T_orig = self.enhance(y, N=self.sde.N, snr=0.33)    # (C,F,T) in forward/feature space
-                x_hat_spec_fwd = x_hat_spec_fwd.squeeze(0).to(self.device)  # (F,T) if your C==1
+                # ---- locate keyword position once per utterance ----------
+                keyword_idx = next(j for j, t in enumerate(labels.tolist()) if t not in special_ids)
 
-                # -------- AUDIO METRICS (unchanged) --------
-                x_hat_td = self.to_audio(x_hat_spec_fwd, T_orig).unsqueeze(0)  # (1, T_orig)
-                x_valid     = x[..., :valid_len].squeeze(0)
-                x_hat_valid = x_hat_td[..., :valid_len].squeeze(0)
+                def run_whisper(signal_16k, multilingual_tokens, labels, keyword_idx):
+                    # 1) move the waveform to the same device Whisper lives on
+                    device = next(self.whisper.parameters()).device
+                    signal  = torch.tensor(signal_16k, dtype=torch.float32, device=device)
 
-                if sr_target != 16000:
-                    x16    = torchaudio.functional.resample(x_valid.unsqueeze(0),    sr_target, 16000).squeeze(0)
-                    xhat16 = torchaudio.functional.resample(x_hat_valid.unsqueeze(0), sr_target, 16000).squeeze(0)
+                    # 2) Whisper’s utility helpers
+                    # signal_padded_ref = whisper.pad_or_trim(signal).flatten()      # (T,)
+                    # mel_ref           = whisper.log_mel_spectrogram(signal_padded_ref).to(device)  # (80, T)
+                    signal_padded = self._pad_or_trim(signal)                  
+                    mel = self._log_mel_spectrogram(signal_padded)
+
+                    # 3) Encoder‑decoder forward
+                    feats  = self.whisper.encoder(mel.unsqueeze(0))            # (1, …, T’)
+                    tokens = multilingual_tokens.to(device).unsqueeze(0)       # (1, L)
+                    logits = self.whisper.decoder(tokens, feats).squeeze(0)    # (L, vocab)
+
+                    # 4) Cross‑entropy w.r.t. the ground‑truth label sequence
+                    ce = self.whisper_loss(logits.view(-1, logits.size(-1)),
+                                    labels.to(device).view(-1)).detach().cpu()
+
+                    # 5) Closed‑set keyword probabilities
+                    kw_logits = logits[keyword_idx]            # vector over entire vocab
+                    kw_probs  = kw_logits.softmax(-1)          # turn into probabilities
+                    kw_probs  = kw_probs[self.allowed_toks.to(device)]  # length‑10
+
+                    pred_id = kw_probs.argmax().item()
+                    return ce, pred_id, kw_probs, mel
+
+                
+                ce_loss_corrupted, pred_id_cor, kw_probs_cor, corrupted_mel = run_whisper(y_16k, multilingual_tokens, labels, keyword_idx)
+                ce_loss_clean, pred_id_cln, kw_probs_cln, clean_mel = run_whisper(x_16k, multilingual_tokens, labels, keyword_idx)
+
+                # Enhance the noisy speech
+                device = next(self.whisper.parameters()).device
+                y_tensor = torch.tensor(y_16k, dtype=torch.float32, device=device)
+                x_hat = self.enhance(y_tensor, N=self.sde.N, snr=0.33)
+                if self.sr != 16000:
+                    x_hat_16k = resample(x_hat, orig_sr=self.sr, target_sr=16000).squeeze()
                 else:
-                    x16, xhat16 = x_valid, x_hat_valid
+                    x_hat_16k = x_hat    
+                
+                ce_loss_enhanced, pred_id_enh, kw_probs_enh, enhanced_mel = run_whisper(x_hat_16k, multilingual_tokens, labels, keyword_idx)
+                true_id = (self.allowed_toks == labels[keyword_idx]).nonzero(as_tuple=True)[0].item()
+                ground_truth = self.allowed_words[true_id]
+                # --- closed-set accuracy ----------------------------------
+                total_cnt   += 1
+                correct_cnt_enhanced += int(pred_id_enh == true_id)
 
-                pesq_sum  += pesq(16000, x16.cpu().numpy(), xhat16.cpu().numpy(), 'wb')
-                si_sdr_sum += si_sdr(x_valid.cpu().numpy(), x_hat_valid.cpu().numpy())
-                estoi_sum += stoi(x_valid.cpu().numpy(), x_hat_valid.cpu().numpy(), sr_target, extended=True)
+                # --- WER lists (as close to original as possible) ---------
+                enhanced_transcript  = self.allowed_words[pred_id_enh]
+                corrupted_transcript = self.allowed_words[pred_id_cor]
+                clean_transcript     = self.allowed_words[pred_id_cln]
 
-                # -------- WER via Whisper, using STFT -> log-mel (no whisper.log_mel_spectrogram) --------
-                # Convert the *forward-transformed* specs back to linear STFT before mel
-                noisy_lin  = self.data_module.spec_back(noisy_spec_fwd)        # (F,T) complex
-                clean_lin  = self.data_module.spec_back(clean_spec_fwd)        # (F,T) complex
-                enh_lin    = self.data_module.spec_back(x_hat_spec_fwd)        # (F,T) complex
+                o_list.append(enhanced_transcript)
+                o_list_corrupted.append(corrupted_transcript)
+                o_list_clean.append(clean_transcript)
+                l_list.append(ground_truth)
+        
+                # pesq_sum += pesq(16000, x_16k, x_hat_16k, 'wb') 
+                try:
+                    pesq_sum  += pesq(16000, x_16k, x_hat_16k, 'wb')
+                    pesq_cnt+=1
+                except Exception:
+                    pass
+                # si_sdr_sum += si_sdr(x, x_hat)
+                si_sdr_sum += si_sdr(torch.tensor(x), torch.tensor(x_hat))
+                estoi_sum += stoi(x, x_hat, self.sr, extended=True)
 
-                y_mel    = stft_to_logmel(noisy_lin)   # (80,3000)
-                x_mel    = stft_to_logmel(clean_lin)   # (80,3000)
-                xhat_mel = stft_to_logmel(enh_lin)     # (80,3000)
+                if self.debug and i< 20:
+                    self._plot_and_save_debug_info(
+                        clean_mel=clean_mel,
+                        corrupted_mel=corrupted_mel,
+                        enhanced_mel=enhanced_mel,
+                        clean_transcript=clean_transcript,
+                        corrupted_transcript=corrupted_transcript,
+                        enhanced_transcript=enhanced_transcript,
+                        ground_truth=ground_truth,
+                        index=i)
 
-                pred_clean    = run_whisper_closedset(x_mel,    multilingual_tokens, labels)
-                pred_noisy    = run_whisper_closedset(y_mel,    multilingual_tokens, labels)
-                pred_enhanced = run_whisper_closedset(xhat_mel, multilingual_tokens, labels)
+            si_sdr_avg = si_sdr_sum / len(clean_files)
+            estoi_avg = estoi_sum / len(clean_files)
+            # --------------- metrics (names kept) -------------------------
+            wer_clean     = self.wer_metric(o_list_clean, l_list)
+            wer_enhanced  = self.wer_metric(o_list, l_list)
+            wer_corrupted = self.wer_metric(o_list_corrupted, l_list)
+            keyword_acc = torch.tensor(correct_cnt_enhanced / max(total_cnt, 1), device=self.device)
 
-                # reference word (first non‑special token)
-                kidx = keyword_index(labels)
-                ref_tok = labels[kidx].item()
-                pos = (self.allowed_toks.cpu() == ref_tok).nonzero(as_tuple=True)[0]
-                ref_word = self.allowed_words[int(pos[0].item())] if len(pos) else self.tokenizer.decode([ref_tok]).strip()
-
-                preds_clean.append(pred_clean)
-                preds_noisy.append(pred_noisy)
-                preds_enh.append(pred_enhanced)
-                refs.append(ref_word)
-
-            # ---- aggregate & log ----
-            denom = len(indices)
-            pesq_avg   = pesq_sum  / denom
-            si_sdr_avg = si_sdr_sum/ denom
-            estoi_avg  = estoi_sum / denom
-
-            wer_clean     = self.wer_metric(preds_clean, refs)
-            wer_corrupted = self.wer_metric(preds_noisy, refs)
-            wer_enhanced  = self.wer_metric(preds_enh,  refs)
-
-            self.log('pesq',          pesq_avg,   on_step=False, on_epoch=True, sync_dist=True)
-            self.log('si_sdr',        si_sdr_avg, on_step=False, on_epoch=True, sync_dist=True)
-            self.log('estoi',         estoi_avg,  on_step=False, on_epoch=True, sync_dist=True)
+            self.log('pesq',pesq_sum / pesq_cnt if pesq_cnt>0 else float('nan'), on_step=False, on_epoch=True, sync_dist=True)
+            self.log('si_sdr', si_sdr_avg, on_step=False, on_epoch=True, sync_dist=True)
+            self.log('estoi', estoi_avg, on_step=False, on_epoch=True, sync_dist=True)
+            self.log('wer_enhanced',  wer_enhanced,  on_step=False, on_epoch=True, sync_dist=True)
             self.log('wer_clean',     wer_clean,     on_step=False, on_epoch=True, sync_dist=True)
             self.log('wer_corrupted', wer_corrupted, on_step=False, on_epoch=True, sync_dist=True)
-            self.log('wer_enhanced',  wer_enhanced,  on_step=False, on_epoch=True, sync_dist=True)
+            self.log('keyword_acc',  keyword_acc, on_step=False, on_epoch=True, sync_dist=True)
 
-        # regular per-batch loss
         loss = self._step(batch, batch_idx)
         self.log('valid_loss', loss, on_step=False, on_epoch=True, sync_dist=True)
-        return loss
 
+        return loss
 
 
     def forward(self, x_t, y, t):
@@ -698,53 +575,162 @@ class WhisperGuidedScoreModel(pl.LightningModule):
 
     def _istft(self, spec, length=None):
         return self.data_module.istft(spec, length)
+    
+    def _pad_or_trim(self, x: torch.Tensor, length: int = 30 * 16_000):
+        """
+        Make every waveform exactly `length` samples (default = 30 s at 16 kHz).
 
-    def enhance(
-    self, y, sampler_type="pc", predictor="reverse_diffusion",
-    corrector="ald", N=30, corrector_steps=1, snr=0.5, timeit=False, **kwargs
+        • Pads at the END with zeros if x is shorter.
+        • Hard‑truncates if x is longer.
+        """
+        if x.size(-1) < length:
+            x = F.pad(x, (0, length - x.size(-1)))
+        else:
+            x = x[..., :length]
+        return x
+    
+    def _log_mel_spectrogram(
+        self,
+        audio: torch.Tensor,
+        n_fft: int = 400,
+        hop: int = 160,
+        n_mels: int = 80,
+        sr: int = 16_000,
+        f_min: float = 0.0,
+        f_max: float = 8_000.0,
     ):
         """
-        Takes a normalized waveform y (1, T), returns ENHANCED SPECTROGRAM (no iSTFT, no (de)normalization).
+        Parameters
+        ----------
+        audio : (T,) 1‑D float32 tensor in −1 … 1
+        Returns
+        -------
+        logmel : (n_mels, 1 + ⌊(T‑n_fft)/hop⌋) tensor ‑‑ identical shape Whisper expects
         """
-        import time
+        # stereo → mono, dtype guard
+        if audio.dim() == 2:
+            audio = audio.mean(0)
+        if audio.dtype != torch.float32:
+            audio = audio.float()
+
+        window = torch.hann_window(n_fft, device=audio.device, dtype=audio.dtype)
+
+        # STFT → power
+        stft = torch.stft(
+            audio,
+            n_fft,
+            hop,
+            window=window,
+            win_length=n_fft,
+            center=True,
+            pad_mode="reflect",
+            return_complex=True,
+        )
+        power = stft.abs().pow(2.0)
+
+        # Mel filterbank (Whisper uses Slaney mel & Slaney norm)
+        fb = torchaudio.functional.melscale_fbanks(
+            n_freqs=n_fft // 2 + 1,
+            sample_rate=sr,          # make it explicit
+            n_mels=n_mels,
+            f_min=f_min,
+            f_max=f_max,
+            norm="slaney",
+            mel_scale="slaney",
+        ).to(power.device) 
+
+        if fb.shape[0] != n_mels:      # old torchaudio → transpose
+            fb = fb.t().contiguous()
+
+        mel = fb @ power
+        mel = mel[:, :-1]
+        log_mel = torch.log10(torch.clamp(mel, min=1e-10))  # +2 to match Whisper’s global shift
+        log_mel = torch.maximum(log_mel, log_mel.max() - 8.0)
+        log_mel = (log_mel + 4.0) / 4.0
+        return log_mel
+
+    def enhance(self, y, sampler_type="pc", predictor="reverse_diffusion",
+        corrector="ald", N=30, corrector_steps=1, snr=0.5, timeit=False,
+        **kwargs
+    ):
+        """
+        One-call speech enhancement of noisy speech `y`, for convenience.
+        """
         start = time.time()
-
-        device = next(self.parameters()).device
-        y = y.to(device)                     # (1, T)
-        T_orig = y.size(-1)
-
-        # --- NO normalization here; y is assumed already normalized ---
-
-        # STFT -> forward transform -> pad for sampler
-        Y = self._stft(y)                    # complex STFT
-        Y = self._forward_transform(Y)       # model's spec domain
-        Y = Y.unsqueeze(0)                   # (B=1, C, F, T)
+        T_orig = y.size(1) 
+        norm_factor = y.abs().max().item()
+        y = y / norm_factor
+        Y = torch.unsqueeze(self._forward_transform(self._stft(y.cuda())), 0)
         Y = pad_spec(Y)
 
-        # ----- sampling -----
+        # SGMSE sampling with OUVE SDE
         if self.sde.__class__.__name__ == 'OUVESDE':
             if self.sde.sampler_type == "pc":
-                sampler = self.get_pc_sampler(
-                    predictor, corrector, Y, N=N,
-                    corrector_steps=corrector_steps, snr=snr,
-                    intermediate=False, **kwargs
-                )
+                sampler = self.get_pc_sampler(predictor, corrector, Y.cuda(), N=N, 
+                    corrector_steps=corrector_steps, snr=snr, intermediate=False,
+                    **kwargs)
             elif self.sde.sampler_type == "ode":
-                sampler = self.get_ode_sampler(Y, N=N, **kwargs)
+                sampler = self.get_ode_sampler(Y.cuda(), N=N, **kwargs)
             else:
-                raise ValueError(f"Invalid sampler type: {self.sde.sampler_type}")
+                raise ValueError("Invalid sampler type for SGMSE sampling: {}".format(sampler_type))
+        # Schrödinger bridge sampling with VE SDE
         elif self.sde.__class__.__name__ == 'SBVESDE':
-            sampler = self.get_sb_sampler(sde=self.sde, y=Y, sampler_type=self.sde.sampler_type)
+            sampler = self.get_sb_sampler(sde=self.sde, y=Y.cuda(), sampler_type=self.sde.sampler_type)
         else:
-            raise ValueError(f"Invalid SDE type: {self.sde.__class__.__name__}")
+            raise ValueError("Invalid SDE type for speech enhancement: {}".format(self.sde.__class__.__name__))
 
-        sample, nfe = sampler()              # (1, C, F, T)
-        x_hat_spec = sample.squeeze(0)       # (C, F, T)
-
+        sample, nfe = sampler()
+        x_hat = self.to_audio(sample.squeeze(), T_orig)
+        x_hat = x_hat * norm_factor
+        x_hat = x_hat.squeeze().cpu().numpy()
+        end = time.time()
         if timeit:
-            sr = getattr(self.data_module, "sample_rate", 16000)
-            rtf = (time.time() - start) / (T_orig / sr)
-            return x_hat_spec, T_orig, nfe, rtf
+            rtf = (end-start)/(len(x_hat)/self.sr)
+            return x_hat, nfe, rtf
         else:
-            return x_hat_spec, T_orig
-
+            return x_hat
+    
+    def _plot_and_save_debug_info(self, clean_mel, corrupted_mel, enhanced_mel, clean_transcript, corrupted_transcript, enhanced_transcript, ground_truth, index):
+        """
+        Plot and save mel spectrograms and transcripts for debugging
+        """
+        import matplotlib.pyplot as plt
+        import os
+        
+        # Create debug directory if it doesn't exist
+        debug_dir = "debug_plots/"
+        os.makedirs(debug_dir, exist_ok=True)
+        
+        # Plot mel spectrograms
+        fig, axes = plt.subplots(3, 1, figsize=(15, 12))
+        
+        # Clean mel
+        axes[0].imshow(clean_mel.cpu().numpy(), aspect='auto', origin='lower')
+        axes[0].set_title('Clean Mel Spectrogram')
+        axes[0].set_ylabel('Mel Frequency Bands')
+        
+        # Corrupted mel
+        axes[1].imshow(corrupted_mel.cpu().numpy(), aspect='auto', origin='lower')
+        axes[1].set_title('Corrupted Mel Spectrogram')
+        axes[1].set_ylabel('Mel Frequency Bands')
+        
+        # Enhanced mel
+        axes[2].imshow(enhanced_mel.cpu().numpy(), aspect='auto', origin='lower')
+        axes[2].set_title('Enhanced Mel Spectrogram')
+        axes[2].set_ylabel('Mel Frequency Bands')
+        axes[2].set_xlabel('Time Frames')
+        
+        plt.tight_layout()
+        
+        # Save the plot
+        plot_path = os.path.join(debug_dir, f"mel_spectrograms_{index}.png")
+        plt.savefig(plot_path)
+        plt.close()
+        
+        # Save transcripts to a text file
+        transcript_path = os.path.join(debug_dir, f"transcripts_{index}.txt")
+        with open(transcript_path, 'w') as f:
+            f.write(f"Ground Truth: {ground_truth}\n")
+            f.write(f"Clean Transcript: {clean_transcript}\n")
+            f.write(f"Corrupted Transcript: {corrupted_transcript}\n")
+            f.write(f"Enhanced Transcript: {enhanced_transcript}\n")

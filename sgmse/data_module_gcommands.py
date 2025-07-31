@@ -11,6 +11,7 @@ import whisper
 import os
 import numpy as np
 import torch.nn.functional as F
+from sgmse.util.other import pad_spec
 
 
 def get_window(window_type, window_length):
@@ -74,19 +75,12 @@ class Specs(Dataset):
             x = torchaudio.functional.resample(x, sr, self.sample_rate)
         if sr_y != self.sample_rate:
             y = torchaudio.functional.resample(y, sr_y, self.sample_rate)
-        
-        if x.ndim == 2:
-            x = x.mean(dim=0)        # (T,)
-        else:
-            x = x.squeeze(0)         # (T,) if shape was (1, T)
+        # convert x,y from [1, T] to [T]
+        if x.dim() == 2:
+            x = x.squeeze(0)
+        if y.dim() == 2:
+            y = y.squeeze(0)
 
-        if y.ndim == 2:
-            y = y.mean(dim=0)        # (T,)
-        else:
-            y = y.squeeze(0)         # (T,) if shape was (1, T)
-        
-        len_x = x.size(-1)
-        len_y = y.size(-1)
         # formula applies for center=True
         target_len = (self.num_frames - 1) * self.hop_length
         current_len = x.size(-1)
@@ -101,8 +95,10 @@ class Specs(Dataset):
             y = y[..., start:start+target_len]
         else:
             # pad audio if the length T is smaller than num_frames
-            x = F.pad(x, (0, pad), mode='constant')
-            y = F.pad(y, (0, pad), mode='constant')
+            # x = F.pad(x, (0, pad), mode='constant')
+            # y = F.pad(y, (0, pad), mode='constant')
+            x = F.pad(x, (pad//2, pad//2+(pad%2)), mode='constant')
+            y = F.pad(y, (pad//2, pad//2+(pad%2)), mode='constant')
 
         # normalize w.r.t to the noisy or the clean signal or not at all
         # to ensure same clean signal power in x and y.
@@ -119,18 +115,9 @@ class Specs(Dataset):
         Y = torch.stft(y, **self.stft_kwargs)
 
         X, Y = self.spec_transform(X), self.spec_transform(Y)
+        # X = pad_spec(X, mode="zero_pad")
+        # Y = pad_spec(Y, mode="zero_pad")
         specs = torch.stack([Y, X], dim=0)  # (2, F, T), complex
-
-        Fx, T = X.shape
-        x_frames = min(T, len_x // self.hop_length)
-        y_frames = min(T, len_y // self.hop_length)
-
-        x_mask = torch.zeros((Fx, T), dtype=torch.float32, device=X.device)
-        y_mask = torch.zeros((Fx, T), dtype=torch.float32, device=Y.device)
-        x_mask[:, :x_frames] = 1.0
-        y_mask[:, :y_frames] = 1.0
-
-        masks = torch.stack([y_mask, x_mask], dim=0)  # (2, F, T)
 
         # ---- tokens & labels (same as your mel code) ----
         tokens = [*self.multilingual_tokenizer.sot_sequence_including_notimestamps] \
@@ -139,8 +126,8 @@ class Specs(Dataset):
         multilingual_tokens = torch.tensor(tokens, dtype=torch.long)
         labels = torch.tensor(labels, dtype=torch.long)
 
-        # return: stacked STFTs, masks, tokens, labels
-        return specs, masks, multilingual_tokens, labels
+        # return: stacked STFTs, tokens, labels
+        return specs, multilingual_tokens, labels, current_len
 
     def __len__(self):
         if self.dummy:
@@ -157,19 +144,20 @@ class STFTDataCollatorWithPadding:
 
     def __call__(self, features):
         # features is a list of tuples from __getitem__:
-        # (specs, masks, multilingual_tokens, labels)
-        specs, masks, toks, labs = zip(*features)
+        # (specs, multilingual_tokens, labels)
+        specs, toks, labs, lengths = zip(*features)
 
         # Stack fixed-size tensors
         specs = torch.stack(specs)  # (B, 2, F, T), complex dtype preserved
-        masks = torch.stack(masks)  # (B, 2, F, T)
 
         # Pad variable-length sequences
-        max_len = max(max(len(t) for t in toks), max(len(l) for l in labs))
+        max_len = max(max(len(t) for t in toks), max(len(lbl) for lbl in labs))
         toks = torch.stack([F.pad(t, (0, max_len - len(t)), value=self.eot_id) for t in toks])
-        labs = torch.stack([F.pad(l, (0, max_len - len(l)), value=self.ignore_index) for l in labs])
+        labs = torch.stack([F.pad(lbl, (0, max_len - len(lbl)), value=self.ignore_index) for lbl in labs])
 
-        return {"specs": specs, "masks": masks, "multilingual_tokens": toks, "labels": labs}
+        lengths = torch.tensor(lengths, dtype=torch.long)
+
+        return {"specs": specs, "multilingual_tokens": toks, "labels": labs, "lengths": lengths}
 
 
 class SpecsDataModule(pl.LightningDataModule):
@@ -177,10 +165,10 @@ class SpecsDataModule(pl.LightningDataModule):
     def add_argparse_args(parser):
         parser.add_argument("--base_dir", type=str, default="/mlspeech/data/gilad/google_commands_reverb", help="The base directory of the dataset. Should contain `train`, `valid` and `test` subdirectories, each of which contain `clean` and `noisy` subdirectories.")
         parser.add_argument("--format", type=str, choices=("default", "reverb"), default="default", help="Read file paths according to file naming format.")
-        parser.add_argument("--batch_size", type=int, default=4, help="The batch size. 8 by default.")
-        parser.add_argument("--n_fft", type=int, default=400, help="Number of FFT bins. 510 by default.")   # to assure 256 freq bins
-        parser.add_argument("--hop_length", type=int, default=160, help="Window hop length. 128 by default.")
-        parser.add_argument("--num_frames", type=int, default=3001, help="Number of frames for the dataset. 256 by default.")
+        parser.add_argument("--batch_size", type=int, default=8, help="The batch size. 8 by default.")
+        parser.add_argument("--n_fft", type=int, default=510, help="Number of FFT bins. 510 by default.")   # to assure 256 freq bins
+        parser.add_argument("--hop_length", type=int, default=128, help="Window hop length. 128 by default.")
+        parser.add_argument("--num_frames", type=int, default=128, help="Number of frames for the dataset. 256 by default.")
         parser.add_argument("--window", type=str, choices=("sqrthann", "hann"), default="hann", help="The window function to use for the STFT. 'hann' by default.")
         parser.add_argument("--num_workers", type=int, default=4, help="Number of workers to use for DataLoaders. 4 by default.")
         parser.add_argument("--dummy", action="store_true", help="Use reduced dummy dataset for prototyping.")
